@@ -12,7 +12,12 @@ import requests
 import xml.etree.ElementTree as ET
 import pandas as pd
 
-load_dotenv(".env")
+load_dotenv(dotenv_path=".env")
+
+# ==========================================
+# 0. 버전 표식
+# ==========================================
+APP_VERSION = "2026-04-11-main-full-human-readable-v1"
 
 # ==========================================
 # 1. 전역 상태 및 캐시 변수
@@ -66,6 +71,49 @@ def is_kiwoom_enabled():
     return os.getenv("ENABLE_KIWOOM", "false").strip().lower() == "true"
 
 
+def label_overheat(overheat: bool):
+    return "과열" if overheat else "과열 아님"
+
+
+def label_pullback(pullback: bool, current_price, ma20):
+    if current_price is None or ma20 is None:
+        return "판단 불가"
+
+    gap = ((current_price / ma20) - 1) * 100
+
+    if pullback:
+        return "20일선 눌림 구간"
+
+    if gap > 10:
+        return "20일선 과도한 이격"
+    elif gap > 3:
+        return "20일선 위 추격 구간"
+    elif gap >= -3:
+        return "20일선 근처"
+    else:
+        return "20일선 하회"
+
+
+def label_volume(volume_up: bool, volume_today, vol_avg20):
+    if volume_today is None or vol_avg20 is None:
+        return "판단 불가"
+
+    if volume_up:
+        return "평균 대비 증가"
+
+    ratio = volume_today / vol_avg20 if vol_avg20 else None
+    if ratio is None:
+        return "판단 불가"
+
+    if ratio >= 0.9:
+        return "평균 수준"
+    else:
+        return "평균 이하"
+
+
+# ==========================================
+# 3. DART 고유번호 로딩
+# ==========================================
 def refresh_corp_data():
     dart_api_key = os.getenv("DART_API_KEY")
     if not dart_api_key:
@@ -123,6 +171,9 @@ def ensure_corp_data_loaded():
         raise HTTPException(status_code=500, detail=f"고유번호 로드 실패: {str(e)}")
 
 
+# ==========================================
+# 4. 키움 토큰 및 데이터
+# ==========================================
 def get_kiwoom_token():
     """키움 토큰 발급 또는 재사용"""
     global KIWOOM_TOKEN, TOKEN_EXPIRES_AT
@@ -165,6 +216,150 @@ def get_kiwoom_token():
     return KIWOOM_TOKEN
 
 
+def fetch_kiwoom_price(stock_code: str):
+    """로컬(키움 ON) 환경에서만 사용"""
+    app_key = os.getenv("KIWOOM_APP_KEY")
+    if not app_key:
+        raise HTTPException(status_code=500, detail="KIWOOM_APP_KEY 설정 안됨")
+
+    access_token = get_kiwoom_token()
+
+    headers = {
+        "Content-Type": "application/json;charset=UTF-8",
+        "authorization": f"Bearer {access_token}",
+        "appkey": app_key,
+        "api-id": "ka10001",
+    }
+
+    response = requests.post(
+        "https://api.kiwoom.com/api/dostk/stkinfo",
+        headers=headers,
+        json={"stk_cd": stock_code},
+        timeout=20,
+    )
+    response.raise_for_status()
+    data = response.json()
+
+    return {
+        "현재가": clean_number(data.get("cur_prc")),
+        "250일최고가": clean_number(data.get("250hgst")),
+        "거래량": clean_number(data.get("trde_qty")),
+        "등락률": clean_number(data.get("flu_rt"), keep_sign=True),
+    }
+
+
+def fetch_kiwoom_chart(stock_code: str):
+    """로컬(키움 ON) 환경에서만 사용"""
+    app_key = os.getenv("KIWOOM_APP_KEY")
+    if not app_key:
+        raise HTTPException(status_code=500, detail="KIWOOM_APP_KEY 설정 안됨")
+
+    access_token = get_kiwoom_token()
+
+    headers = {
+        "Content-Type": "application/json;charset=UTF-8",
+        "authorization": f"Bearer {access_token}",
+        "appkey": app_key,
+        "api-id": "ka10081",
+    }
+
+    response = requests.post(
+        "https://api.kiwoom.com/api/dostk/chart",
+        headers=headers,
+        json={
+            "stk_cd": stock_code,
+            "base_dt": datetime.now().strftime("%Y%m%d"),
+            "upd_stkpc_tp": "1",
+        },
+        timeout=20,
+    )
+    response.raise_for_status()
+    data = response.json()
+
+    rows = data.get("stk_dt_pole_chart_qry", [])
+    closes = [
+        clean_number(x.get("cur_prc"))
+        for x in rows
+        if clean_number(x.get("cur_prc")) is not None
+    ]
+    volumes = [
+        clean_number(x.get("trde_qty"))
+        for x in rows
+        if clean_number(x.get("trde_qty")) is not None
+    ]
+
+    return {
+        "closes": closes,
+        "volumes": volumes,
+    }
+
+
+# ==========================================
+# 5. 외부 대체용 웹 차트 수집
+# ==========================================
+def fetch_public_naver_chart(stock_code: str, max_pages: int = 25):
+    """
+    외부(Render 등, 키움 OFF) 환경에서는 네이버 금융 일봉 데이터를 사용
+    """
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0",
+        "Referer": f"https://finance.naver.com/item/main.nhn?code={stock_code}",
+    })
+
+    closes = []
+    volumes = []
+    dates = []
+
+    for page in range(1, max_pages + 1):
+        url = f"https://finance.naver.com/item/sise_day.naver?code={stock_code}&page={page}"
+        response = session.get(url, timeout=10)
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        table = soup.select_one("table.type2")
+        if not table:
+            continue
+
+        for tr in table.select("tr"):
+            cols = [td.get_text(strip=True).replace(",", "") for td in tr.select("td")]
+            if len(cols) != 7:
+                continue
+            if not cols[0] or cols[0] == "날짜":
+                continue
+
+            try:
+                date_text = cols[0]
+                close = int(cols[1])
+                volume = int(cols[6])
+            except Exception:
+                continue
+
+            dates.append(date_text)
+            closes.append(close)
+            volumes.append(volume)
+
+    if not closes:
+        raise HTTPException(status_code=500, detail="웹 차트 데이터 수집 실패")
+
+    current_price = closes[0]
+    volume_today = volumes[0]
+    high_250 = max(closes[:250]) if len(closes) >= 1 else None
+
+    return {
+        "현재가": current_price,
+        "250일최고가": high_250,
+        "거래량": volume_today,
+        "등락률": None,
+        "closes": closes,
+        "volumes": volumes,
+        "dates": dates,
+    }
+
+
+# ==========================================
+# 6. 종목 검색 및 DART 재무
+# ==========================================
 def find_stock(query: str):
     """
     종목명/종목코드 검색
@@ -300,148 +495,9 @@ def fetch_dart_fundamentals(corp_code: str):
     }
 
 
-def fetch_kiwoom_price(stock_code: str):
-    """
-    로컬(키움 ON) 환경에서만 사용
-    """
-    app_key = os.getenv("KIWOOM_APP_KEY")
-    if not app_key:
-        raise HTTPException(status_code=500, detail="KIWOOM_APP_KEY 설정 안됨")
-
-    access_token = get_kiwoom_token()
-
-    headers = {
-        "Content-Type": "application/json;charset=UTF-8",
-        "authorization": f"Bearer {access_token}",
-        "appkey": app_key,
-        "api-id": "ka10001",
-    }
-
-    response = requests.post(
-        "https://api.kiwoom.com/api/dostk/stkinfo",
-        headers=headers,
-        json={"stk_cd": stock_code},
-        timeout=20,
-    )
-    response.raise_for_status()
-    data = response.json()
-
-    return {
-        "현재가": clean_number(data.get("cur_prc")),
-        "250일최고가": clean_number(data.get("250hgst")),
-        "거래량": clean_number(data.get("trde_qty")),
-        "등락률": clean_number(data.get("flu_rt"), keep_sign=True),
-    }
-
-
-def fetch_kiwoom_chart(stock_code: str):
-    """
-    로컬(키움 ON) 환경에서만 사용
-    """
-    app_key = os.getenv("KIWOOM_APP_KEY")
-    if not app_key:
-        raise HTTPException(status_code=500, detail="KIWOOM_APP_KEY 설정 안됨")
-
-    access_token = get_kiwoom_token()
-
-    headers = {
-        "Content-Type": "application/json;charset=UTF-8",
-        "authorization": f"Bearer {access_token}",
-        "appkey": app_key,
-        "api-id": "ka10081",
-    }
-
-    response = requests.post(
-        "https://api.kiwoom.com/api/dostk/chart",
-        headers=headers,
-        json={
-            "stk_cd": stock_code,
-            "base_dt": datetime.now().strftime("%Y%m%d"),
-            "upd_stkpc_tp": "1",
-        },
-        timeout=20,
-    )
-    response.raise_for_status()
-    data = response.json()
-
-    rows = data.get("stk_dt_pole_chart_qry", [])
-    closes = [
-        clean_number(x.get("cur_prc"))
-        for x in rows
-        if clean_number(x.get("cur_prc")) is not None
-    ]
-    volumes = [
-        clean_number(x.get("trde_qty"))
-        for x in rows
-        if clean_number(x.get("trde_qty")) is not None
-    ]
-
-    return {
-        "closes": closes,
-        "volumes": volumes,
-    }
-
-
-def fetch_public_naver_chart(stock_code: str, max_pages: int = 25):
-    """
-    외부(Render 등, 키움 OFF) 환경에서는 네이버 금융 일봉 데이터를 사용
-    """
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0",
-        "Referer": f"https://finance.naver.com/item/main.nhn?code={stock_code}",
-    })
-
-    closes = []
-    volumes = []
-    dates = []
-
-    for page in range(1, max_pages + 1):
-        url = f"https://finance.naver.com/item/sise_day.naver?code={stock_code}&page={page}"
-        response = session.get(url, timeout=10)
-        response.raise_for_status()
-
-        soup = BeautifulSoup(response.text, "html.parser")
-        table = soup.select_one("table.type2")
-        if not table:
-            continue
-
-        for tr in table.select("tr"):
-            cols = [td.get_text(strip=True).replace(",", "") for td in tr.select("td")]
-            if len(cols) != 7:
-                continue
-            if not cols[0] or cols[0] == "날짜":
-                continue
-
-            try:
-                date_text = cols[0]
-                close = int(cols[1])
-                volume = int(cols[6])
-            except Exception:
-                continue
-
-            dates.append(date_text)
-            closes.append(close)
-            volumes.append(volume)
-
-    if not closes:
-        raise HTTPException(status_code=500, detail="웹 차트 데이터 수집 실패")
-
-    current_price = closes[0]
-    volume_today = volumes[0]
-    high_250 = max(closes[:250]) if len(closes) >= 1 else None
-
-    return {
-        "현재가": current_price,
-        "250일최고가": high_250,
-        "거래량": volume_today,
-        "등락률": None,
-        "closes": closes,
-        "volumes": volumes,
-        "dates": dates,
-    }
-
-
+# ==========================================
+# 7. 최종 분석 결과 생성
+# ==========================================
 def build_analysis_result(
     found_name: str,
     stock_code: str,
@@ -471,6 +527,7 @@ def build_analysis_result(
             "환경": {
                 "kiwoom_enabled": is_kiwoom_enabled(),
                 "chart_source": chart_mode,
+                "version": APP_VERSION,
             }
         }
 
@@ -483,6 +540,7 @@ def build_analysis_result(
             "환경": {
                 "kiwoom_enabled": is_kiwoom_enabled(),
                 "chart_source": chart_mode,
+                "version": APP_VERSION,
             }
         }
 
@@ -533,13 +591,30 @@ def build_analysis_result(
         final = "신고가 준비"
         action = "돌파 여부 관찰"
 
+    overheat_text = label_overheat(overheat)
+    pullback_text = label_pullback(pullback, current_price, ma20)
+    volume_text = label_volume(volume_up, volume_today, vol_avg20)
+
+    if chart_ok and not overheat and not pullback:
+        current_zone = "상승 추세 유지 구간"
+    elif pullback:
+        current_zone = "눌림목 관찰 구간"
+    elif overheat:
+        current_zone = "단기 과열 구간"
+    elif trend_break:
+        current_zone = "추세 훼손 주의 구간"
+    else:
+        current_zone = "관찰 구간"
+
     return {
         "status": "ok",
+        "version": APP_VERSION,
         "종목명": found_name,
         "종목코드": stock_code,
         "분석결과": {
             "최종판단": final,
             "대응전략": action,
+            "현재구간해석": current_zone,
         },
         "재무": {
             "판정": "적격" if fundamental_ok else "부적격",
@@ -554,10 +629,20 @@ def build_analysis_result(
             "250일최고가": high_250,
             "신고가대비비율": f"{round(breakout_ratio * 100, 1)}%",
             "차트추세": "정배열/우상향" if chart_ok else "역배열/혼조",
+
             "과열여부": overheat,
+            "과열판정": overheat_text,
+
             "20일선눌림": pullback,
+            "진입위치판정": pullback_text,
+
             "거래량증가": volume_up,
+            "거래량판정": volume_text,
+
             "등락률": market_data.get("등락률"),
+            "거래량": volume_today,
+            "20일평균거래량": round(vol_avg20, 0),
+
             "이평선": {
                 "ma20": round(ma20, 0),
                 "ma60": round(ma60, 0),
@@ -568,12 +653,13 @@ def build_analysis_result(
         "환경": {
             "kiwoom_enabled": is_kiwoom_enabled(),
             "chart_source": chart_mode,
+            "version": APP_VERSION,
         }
     }
 
 
 # ==========================================
-# 3. FastAPI 설정
+# 8. FastAPI 설정
 # ==========================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -610,13 +696,14 @@ app.add_middleware(
 
 
 # ==========================================
-# 4. 기본 엔드포인트
+# 9. 기본 엔드포인트
 # ==========================================
 @app.get("/")
 def root():
     return {
         "status": "ok",
         "message": "서버 정상 작동 중",
+        "version": APP_VERSION,
         "startup": STARTUP_STATUS,
         "kiwoom_enabled": is_kiwoom_enabled(),
     }
@@ -626,6 +713,7 @@ def root():
 def health():
     return {
         "status": "ok",
+        "version": APP_VERSION,
         "startup": STARTUP_STATUS,
         "corp_list_count": len(CORP_LIST),
         "env": {
@@ -639,8 +727,7 @@ def health():
 
 @app.get("/resolve-stock")
 def resolve_stock(query: str):
-    result = find_stock(query)
-    return result
+    return find_stock(query)
 
 
 @app.get("/dart-financial-simple")
@@ -648,6 +735,7 @@ def dart_financial_simple(corp_code: str):
     data = fetch_dart_fundamentals(corp_code)
     return {
         "status": "ok",
+        "version": APP_VERSION,
         "corp_code": corp_code,
         "매출액": data.get("매출액"),
         "영업이익": data.get("영업이익"),
@@ -663,11 +751,12 @@ def dart_financial_simple(corp_code: str):
 
 
 # ==========================================
-# 5. 메인 분석 로직
+# 10. 메인 분석 로직
 # ==========================================
 def _run_stock_analysis_internal(query: str):
     stock = find_stock(query)
     if stock.get("status") != "ok":
+        stock["version"] = APP_VERSION
         return stock
 
     found_name = stock["종목명"]
@@ -677,9 +766,13 @@ def _run_stock_analysis_internal(query: str):
     try:
         financial = fetch_dart_fundamentals(corp_code)
     except Exception as e:
-        return {"status": "error", "message": f"재무 데이터 로드 에러: {str(e)}"}
+        return {
+            "status": "error",
+            "version": APP_VERSION,
+            "message": f"재무 데이터 로드 에러: {str(e)}"
+        }
 
-    # 로컬이면 키움 우선, 실패하면 웹 대체
+    # 로컬: 키움 ON이면 키움 우선
     if is_kiwoom_enabled():
         try:
             price_data = fetch_kiwoom_price(stock_code)
@@ -703,7 +796,7 @@ def _run_stock_analysis_internal(query: str):
             )
 
         except Exception:
-            # 키움 실패 시 웹 대체
+            # 키움 실패 시 네이버 fallback
             try:
                 public_data = fetch_public_naver_chart(stock_code)
                 return build_analysis_result(
@@ -716,11 +809,13 @@ def _run_stock_analysis_internal(query: str):
             except Exception as e2:
                 return {
                     "status": "ok",
+                    "version": APP_VERSION,
                     "종목명": found_name,
                     "종목코드": stock_code,
                     "분석결과": {
                         "최종판단": "재무 중심 분석만 가능",
-                        "대응전략": "키움 및 웹 차트 데이터 수집 실패"
+                        "대응전략": "키움 및 웹 차트 데이터 수집 실패",
+                        "현재구간해석": "차트 판단 불가",
                     },
                     "재무": {
                         "판정": "적격" if financial.get("재무적격") else "부적격",
@@ -740,9 +835,14 @@ def _run_stock_analysis_internal(query: str):
                         "신고가대비비율": None,
                         "차트추세": f"차트 데이터 수집 실패: {str(e2)}",
                         "과열여부": None,
+                        "과열판정": "판단 불가",
                         "20일선눌림": None,
+                        "진입위치판정": "판단 불가",
                         "거래량증가": None,
+                        "거래량판정": "판단 불가",
                         "등락률": None,
+                        "거래량": None,
+                        "20일평균거래량": None,
                         "이평선": {
                             "ma20": None,
                             "ma60": None,
@@ -753,10 +853,11 @@ def _run_stock_analysis_internal(query: str):
                     "환경": {
                         "kiwoom_enabled": True,
                         "chart_source": "none",
+                        "version": APP_VERSION,
                     }
                 }
 
-    # 외부(Render 등)에서는 웹 대체만 사용
+    # 외부(Render): 키움 OFF → 네이버 공개 차트만 사용
     try:
         public_data = fetch_public_naver_chart(stock_code)
         return build_analysis_result(
@@ -769,11 +870,13 @@ def _run_stock_analysis_internal(query: str):
     except Exception as e:
         return {
             "status": "ok",
+            "version": APP_VERSION,
             "종목명": found_name,
             "종목코드": stock_code,
             "분석결과": {
                 "최종판단": "재무 중심 분석만 가능",
-                "대응전략": "외부 서버 환경에서는 웹 차트 수집 실패"
+                "대응전략": "외부 서버 환경에서는 웹 차트 수집 실패",
+                "현재구간해석": "차트 판단 불가",
             },
             "재무": {
                 "판정": "적격" if financial.get("재무적격") else "부적격",
@@ -793,9 +896,14 @@ def _run_stock_analysis_internal(query: str):
                 "신고가대비비율": None,
                 "차트추세": f"웹 차트 수집 실패: {str(e)}",
                 "과열여부": None,
+                "과열판정": "판단 불가",
                 "20일선눌림": None,
+                "진입위치판정": "판단 불가",
                 "거래량증가": None,
+                "거래량판정": "판단 불가",
                 "등락률": None,
+                "거래량": None,
+                "20일평균거래량": None,
                 "이평선": {
                     "ma20": None,
                     "ma60": None,
@@ -806,6 +914,7 @@ def _run_stock_analysis_internal(query: str):
             "환경": {
                 "kiwoom_enabled": False,
                 "chart_source": "none",
+                "version": APP_VERSION,
             }
         }
 
