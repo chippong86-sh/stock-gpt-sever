@@ -559,7 +559,6 @@ def build_analysis_result(
     ma200 = float(df_price["c"].head(200).mean())
     vol_avg20 = float(df_vol["v"].head(20).mean())
 
-    volume_up = bool(volume_today and vol_avg20 and volume_today > vol_avg20)
     chart_ok = bool(
         current_price
         and current_price > ma150
@@ -567,44 +566,133 @@ def build_analysis_result(
         and ma150 > ma200
         and ma20 > ma60
     )
-    overheat = bool(current_price and current_price > ma20 * 1.10)
-    pullback = bool(current_price and ma20 * 0.97 <= current_price <= ma20 * 1.03)
     trend_break = bool(current_price and current_price < ma60)
+
+    dist_ma20 = ((current_price / ma20) - 1) * 100 if current_price and ma20 else None
+    volume_up = bool(volume_today and vol_avg20 and volume_today > vol_avg20)
+
+    # 기존보다 조금 넓게 잡은 눌림 기준
+    pullback = bool(current_price and ma20 * 0.96 <= current_price <= ma20 * 1.04)
+
+    # 최근 20일(오늘 제외) 박스 확인
+    recent_20 = closes[1:21] if len(closes) >= 21 else closes[1:]
+    recent_20_high = max(recent_20) if recent_20 else None
+    recent_20_low = min(recent_20) if recent_20 else None
+    consolidation_ok = bool(
+        recent_20_high
+        and recent_20_low
+        and (recent_20_high - recent_20_low) / recent_20_high <= 0.12
+    )
+
+    # 1차 돌파 매수: 신고가 근처 또는 돌파 초입 + 거래량 증가
+    breakout_entry = bool(
+        chart_ok
+        and current_price
+        and high_250
+        and current_price >= high_250 * 0.995
+        and current_price <= high_250 * 1.03
+        and volume_today
+        and vol_avg20
+        and volume_today >= vol_avg20 * 1.5
+    )
+
+    # 재돌파 매수: 최근 박스 상단 재돌파 + 거래량 증가
+    rebreakout_entry = bool(
+        chart_ok
+        and consolidation_ok
+        and recent_20_high
+        and current_price > recent_20_high
+        and current_price <= recent_20_high * 1.03
+        and volume_today
+        and vol_avg20
+        and volume_today >= vol_avg20 * 1.2
+    )
+
+    # 과열은 진짜 추격 구간일 때만
+    overheat = bool(
+        dist_ma20 is not None
+        and dist_ma20 > 10
+        and not breakout_entry
+        and not rebreakout_entry
+    )
 
     final = "관망"
     action = "대기"
+    timing = "신규 진입 금지"
+    chase_allowed = "비추천"
 
     if trend_break:
         final = "추세훼손 주의"
-        action = "60일선 이탈, 신규 진입 보류"
+        action = "60일선 이탈, 신규 진입 금지"
+        timing = "신규 진입 금지"
+        chase_allowed = "불가"
+
     elif chart_ok and fundamental_ok:
-        if overheat:
-            final = "단기 과열"
-            action = "매수 금지 (조정 대기)"
+        if breakout_entry:
+            final = "초기 돌파 진입 가능"
+            action = "거래량 동반 돌파 초입, 1차 진입 가능"
+            timing = "초기 진입 가능"
+            chase_allowed = "가능(돌파가 대비 +3% 이내일 때만)"
+
+        elif rebreakout_entry:
+            final = "재돌파 진입 가능"
+            action = "짧은 횡보 후 재돌파 구간, 재진입 가능"
+            timing = "재돌파 진입 가능"
+            chase_allowed = "가능(재돌파 가격 대비 +3% 이내일 때만)"
+
         elif pullback:
-            final = "매수 타점"
-            action = "20일선 눌림목 매수 접근"
+            final = "눌림목 진입 가능"
+            action = "20일선 또는 직전 지지 부근, 눌림 진입 가능"
+            timing = "눌림목 진입 가능"
+            chase_allowed = "비추천"
+
+        elif overheat:
+            final = "과열 보류"
+            action = "추세는 좋지만 이격 과도, 조정 대기"
+            timing = "과열 보류"
+            chase_allowed = "불가"
+
         else:
             final = "상승 추세"
-            action = "보유자 영역"
-    elif fundamental_ok and breakout_ratio > 0.90:
-        final = "신고가 준비"
-        action = "돌파 여부 관찰"
+            action = "보유자 영역 / 신규는 첫 눌림 또는 재돌파 대기"
+            timing = "눌림목 대기"
+            chase_allowed = "비추천"
 
-    overheat_text = label_overheat(overheat)
+    elif fundamental_ok and breakout_ratio > 0.97:
+        final = "돌파 확인 필요"
+        action = "신고가 근처, 거래량 동반 돌파 확인 필요"
+        timing = "돌파 확인 후 진입"
+        chase_allowed = "비추천"
+
+    overheat_text = "과열" if overheat else "과열 아님"
     pullback_text = label_pullback(pullback, current_price, ma20)
     volume_text = label_volume(volume_up, volume_today, vol_avg20)
 
-    if chart_ok and not overheat and not pullback:
-        current_zone = "상승 추세 유지 구간"
+    if breakout_entry:
+        current_zone = "거래량 동반 돌파 초입"
+    elif rebreakout_entry:
+        current_zone = "짧은 횡보 후 재돌파 구간"
     elif pullback:
-        current_zone = "눌림목 관찰 구간"
+        current_zone = "첫 눌림 또는 지지 재확인 구간"
     elif overheat:
-        current_zone = "단기 과열 구간"
+        current_zone = "추격 부담이 큰 과열 구간"
     elif trend_break:
         current_zone = "추세 훼손 주의 구간"
     else:
-        current_zone = "관찰 구간"
+        current_zone = "상승 추세 유지 구간"
+
+    if breakout_entry and high_250:
+        ideal_entry = f"{round(high_250, 0)} ~ {round(high_250 * 1.03, 0)}"
+        recheck = "돌파 종가 유지 및 거래량 재확인"
+    elif rebreakout_entry and recent_20_high:
+        ideal_entry = f"{round(recent_20_high, 0)} ~ {round(recent_20_high * 1.03, 0)}"
+        recheck = "재돌파 유지 여부와 거래량 재확인"
+    elif pullback:
+        ideal_entry = f"{round(ma20 * 0.98, 0)} ~ {round(ma20 * 1.02, 0)}"
+        recheck = "20일선 지지 여부 확인"
+    else:
+        ideal_entry = "현재가 추격보다 눌림 또는 돌파 확인 우선"
+        recheck = "20일선 재접근 또는 거래량 동반 재돌파 확인"
 
     return {
         "status": "ok",
@@ -615,6 +703,10 @@ def build_analysis_result(
             "최종판단": final,
             "대응전략": action,
             "현재구간해석": current_zone,
+            "매수타이밍판정": timing,
+            "이상적진입구간": ideal_entry,
+            "추격매수가능여부": chase_allowed,
+            "재확인조건": recheck,
         },
         "재무": {
             "판정": "적격" if fundamental_ok else "부적격",
